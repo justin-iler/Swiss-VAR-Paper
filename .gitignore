@@ -1,0 +1,11 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+Code/*.pdf
+Code/*.tex
+Code/*_files/
+Code/*.log
+Report/*.aux
+Report/*.log
+Report/*.out

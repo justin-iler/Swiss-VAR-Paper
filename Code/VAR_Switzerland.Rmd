@@ -1,0 +1,579 @@
+---
+title: "Bayesian VAR Forecasting and Fiscal Policy Analysis for Switzerland"
+author: "Justin Iler and Prathinav Vishnu"
+date: "April 2023 (code revised October 2026)"
+header-includes:
+  - \usepackage{booktabs}
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Paths are relative to this file (rmarkdown::render runs from Code/)
+data_dir <- "../Data"
+fig_dir  <- "../Figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# Draw a figure to the knitted document and save it as a PNG in Figures/
+fSaveFigure <- function(name, width, height, draw){
+  png(file.path(fig_dir, name), width=width, height=height, units="in", res=300)
+  draw()
+  dev.off()
+  draw()
+}
+```
+
+```{r packages, include=FALSE}
+library(CholWishart)
+library(MCMCpack)
+library(mvtnorm)
+library(seasonal)
+```
+
+```{r load_data, include=FALSE}
+RGDP  <- read.csv(file.path(data_dir, "RGDP.Swiss.csv"))
+UnEmp <- read.csv(file.path(data_dir, "UnEmp.Swiss.csv"))
+Infl  <- read.csv(file.path(data_dir, "Inf.Swiss.csv"))
+Int   <- read.csv(file.path(data_dir, "Int.Swiss.csv"))
+
+RGDP  <- ts(RGDP$RGDP, frequency=4, start=c(1980,1))
+UnEmp <- ts(UnEmp$UnEmp, frequency=4, start=c(2010,1))
+Infl_qq <- ts(Infl$Infl, frequency=4, start=c(1960,1))  # raw q/q % change, not seasonally adjusted
+
+# Seasonally adjusted, annualized inflation (400 x log difference).
+# Rebuild a CPI index from the raw q/q rates, seasonally adjust it with X-13,
+# and take annualized log differences.
+CPI    <- ts(100 * cumprod(1 + Infl_qq / 100), frequency=4, start=c(1960,1))
+CPI_sa <- final(seas(window(CPI, c(1990,1), c(2021,4))))
+Infl   <- 400 * diff(log(CPI_sa))
+Int   <- ts(Int$Int, frequency=4, start=c(1974,1))
+
+# Real government final consumption expenditure, CHF, seasonally adjusted
+# (OECD via FRED, series NAEXKP03CHQ652S); converted to millions of CHF to
+# match RGDP
+GovCons <- read.csv(file.path(data_dir, "GovCons_Real.Swiss.csv"))
+GovCons <- ts(GovCons$NAEXKP03CHQ652S / 1e6, frequency=4, start=c(1980,1))
+```
+
+```{r helpers, include=FALSE}
+fCreateDummyObs <- function(mY, vLambda, p){
+  n <- ncol(mY)
+  k <- n*p + 1
+  vy <- apply(mY, 2, mean)
+  vs <- apply(mY, 2, sd)
+  mY_dummy <- diag(vs * vLambda[1])
+  mX_dummy <- matrix(0, n, k)
+  mX_dummy[, 2:(n+1)] <- diag(vs * vLambda[1])
+  if (p > 1){
+    for (ll in 2:p){
+      mY_dummy_Here <- matrix(0, n, n)
+      mX_dummy_Here <- matrix(0, n, k)
+      mX_dummy_Here[, ((ll-1)*n + 2):(ll*n + 1)] <- diag(vs * vLambda[1] * ll^vLambda[2])
+      mY_dummy <- rbind(mY_dummy, mY_dummy_Here)
+      mX_dummy <- rbind(mX_dummy, mX_dummy_Here)
+    }
+  }
+  mY_dummy_Here <- diag(vs)
+  mX_dummy_Here <- matrix(0, n, k)
+  for (ll in 1:vLambda[3]){
+    mY_dummy <- rbind(mY_dummy, mY_dummy_Here)
+    mX_dummy <- rbind(mX_dummy, mX_dummy_Here)
+  }
+  mY_dummy_Here <- diag(vy * vLambda[4])
+  mX_dummy_Here <- matrix(0, n, k)
+  for (ll in 1:p){
+    mX_dummy_Here[, ((ll-1)*n + 2):(ll*n + 1)] <- diag(vy * vLambda[4])
+  }
+  mY_dummy <- rbind(mY_dummy, mY_dummy_Here)
+  mX_dummy <- rbind(mX_dummy, mX_dummy_Here)
+  mY_dummy_Here <- vy * vLambda[5]
+  mX_dummy_Here <- c(vLambda[5], rep(vy * vLambda[5], times=p))
+  mY_dummy <- rbind(mY_dummy, mY_dummy_Here)
+  mX_dummy <- rbind(mX_dummy, mX_dummy_Here)
+  return(list("mY_dummy"=mY_dummy, "mX_dummy"=mX_dummy))
+}
+
+fMinnesotaPriorParams <- function(mY, vLambda, p){
+  n <- ncol(mY)
+  k <- n*p + 1
+  dummyObs <- fCreateDummyObs(mY, vLambda, p)
+  mY_dummy <- dummyObs$mY_dummy
+  mX_dummy <- dummyObs$mX_dummy
+  mP <- t(mX_dummy) %*% mX_dummy
+  mPhi <- solve(mP) %*% (t(mX_dummy) %*% mY_dummy)
+  mErrors <- (mY_dummy - mX_dummy %*% mPhi)
+  mS <- t(mErrors) %*% mErrors
+  T_star <- nrow(mY_dummy)
+  nu <- T_star - k
+  return(list("mPhi"=mPhi, "mP"=mP, "mS"=mS, "nu"=nu))
+}
+
+fDataVARtoReg <- function(mY, T1, p){
+  n <- ncol(mY)
+  k <- n*p + 1
+  Tall <- nrow(mY)
+  mYY <- mY[T1:Tall, , drop=FALSE]
+  mXX <- matrix(NA, nrow=(Tall-T1+1), ncol=k)
+  mXX[, 1] <- 1
+  for(i in 1:p){
+    mXX[, ((i-1)*n + 2):(i*n + 1)] <- mY[(T1-i):(Tall-i), ]
+  }
+  return(list("mYY"=mYY, "mXX"=mXX))
+}
+
+fGetPosteriorMNIW <- function(mY, T1, p, mPhi_pr, mP_pr, mS_pr, nu_pr){
+  RegData <- fDataVARtoReg(mY, T1, p)
+  mYY <- RegData$mYY
+  mXX <- RegData$mXX
+  T <- nrow(mYY)
+  mP_po <- mP_pr + t(mXX) %*% mXX
+  mPhi_po <- solve(mP_po) %*% (mP_pr %*% mPhi_pr + t(mXX) %*% mYY)
+  mS_po <- mS_pr + t(mPhi_pr) %*% mP_pr %*% mPhi_pr + t(mYY) %*% mYY -
+           t(mPhi_po) %*% mP_po %*% mPhi_po
+  nu_po <- nu_pr + T
+  return(list("mPhi"=mPhi_po, "mP"=mP_po, "mS"=mS_po, "nu"=nu_po))
+}
+
+fGetMDD <- function(T, n, mPhi_pr, mP_pr, mS_pr, nu_pr,
+                    mPhi_po, mP_po, mS_po, nu_po){
+  logMDD <- -T*n/2 * log(pi) +
+    n/2 * (-log(det(mP_po)) + log(det(mP_pr))) -
+    nu_po/2 * log(det(mS_po)) + nu_pr/2 * log(det(mS_pr)) +
+    CholWishart::lmvgamma(nu_po/2, n) - CholWishart::lmvgamma(nu_pr/2, n)
+  return(logMDD)
+}
+
+fDrawMNIW <- function(M, mPhi, mP, mS, nu){
+  k <- nrow(mPhi)
+  n <- ncol(mPhi)
+  vmu <- as.vector(mPhi)
+  mPinv <- solve(mP)
+  aSigma <- array(0, dim=c(n, n, M))
+  aPhi <- array(0, dim=c(k, n, M))
+  for (mm in 1:M){
+    mSigmaHere <- MCMCpack::riwish(v=nu, S=mS)
+    aSigma[, , mm] <- mSigmaHere
+    vmuHere <- mvtnorm::rmvnorm(1, vmu, kronecker(mSigmaHere, mPinv))
+    aPhi[, , mm] <- matrix(vmuHere, k, n)
+  }
+  return(list("Phi"=aPhi, "Sigma"=aSigma))
+}
+
+fVARIRF <- function(Phi_i, Sigma_i, q, Hmax, n, p){
+  Sigma_tr <- t(chol(Sigma_i))
+  IRFmat <- matrix(0, nrow=(Hmax+1), ncol=n)
+  IRFmat[1, ] <- t(Sigma_tr %*% q)
+  xxIRF <- matrix(0, nrow=1, ncol=p*n)
+  xxIRF[1, 1:n] <- IRFmat[1, ]
+  Phi_no_const <- Phi_i[2:(n*p+1), ]
+  for(h in 1:Hmax){
+    IRFmat[(1+h), ] <- xxIRF %*% Phi_no_const
+    if(p > 1){
+      xxIRF[1, (n+1):(n*p)] <- xxIRF[1, 1:(n*(p-1))]
+    }
+    xxIRF[1, 1:n] <- IRFmat[(1+h), ]
+  }
+  return(IRFmat)
+}
+
+# Standardize with the sample's own moments, then jointly pick the lag length
+# p and lambda by MDD. All candidates are evaluated on the
+# same estimation sample, starting at T1 = max(p_grid) + 2; the observations
+# before T1 serve as the pre-sample for the Minnesota prior moments
+# (Del Negro and Schorfheide, 2011). Uses only the data passed in, so it is safe to call
+# recursively without look-ahead.
+fFitBVAR <- function(mY_raw, p_grid, lambda_grid){
+  T1 <- max(p_grid) + 2
+  vMean <- apply(mY_raw, 2, mean)
+  vSd   <- apply(mY_raw, 2, sd)
+  mY <- sweep(sweep(mY_raw, 2, vMean, "-"), 2, vSd, "/")
+  mY_pre <- mY[1:(T1-1), , drop=FALSE]
+  n <- ncol(mY)
+  T_data <- nrow(mY) - T1 + 1
+
+  grid <- expand.grid(p = p_grid, l = seq_along(lambda_grid))
+  grid$MDD <- mapply(function(p, l){
+    pr <- fMinnesotaPriorParams(mY_pre, lambda_grid[[l]], p)
+    po <- fGetPosteriorMNIW(mY, T1, p, pr$mPhi, pr$mP, pr$mS, pr$nu)
+    fGetMDD(T_data, n, pr$mPhi, pr$mP, pr$mS, pr$nu,
+            po$mPhi, po$mP, po$mS, po$nu)
+  }, grid$p, grid$l)
+  grid$lambda1 <- sapply(lambda_grid, `[`, 1)[grid$l]
+
+  best <- grid[which.max(grid$MDD), ]
+  p <- best$p
+  vLambda <- lambda_grid[[best$l]]
+  pr <- fMinnesotaPriorParams(mY_pre, vLambda, p)
+  po <- fGetPosteriorMNIW(mY, T1, p, pr$mPhi, pr$mP, pr$mS, pr$nu)
+  return(list("mY"=mY, "mean"=vMean, "sd"=vSd, "p"=p,
+              "lambda"=vLambda, "grid"=grid[, c("p", "lambda1", "MDD")],
+              "post"=po))
+}
+
+# Iterated h-step forecasts from the end of the fitted sample, in original
+# units. With shocks=TRUE, draws from the full predictive distribution.
+fForecastBVAR <- function(fit, H, M, shocks=FALSE){
+  draws <- fDrawMNIW(M, fit$post$mPhi, fit$post$mP, fit$post$mS, fit$post$nu)
+  n <- ncol(fit$mY)
+  p <- fit$p
+  Tn <- nrow(fit$mY)
+  aFcst <- array(NA, dim=c(H, n, M))
+  for (m in 1:M){
+    Phi_m <- draws$Phi[, , m]
+    mLags <- fit$mY[Tn:(Tn-p+1), , drop=FALSE]  # row 1 = most recent
+    for (h in 1:H){
+      y_h <- drop(c(1, t(mLags)) %*% Phi_m)
+      if (shocks) y_h <- y_h + drop(mvtnorm::rmvnorm(1, sigma=draws$Sigma[, , m]))
+      aFcst[h, , m] <- y_h
+      mLags <- rbind(y_h, mLags)[1:p, , drop=FALSE]
+    }
+  }
+  for (j in 1:n) aFcst[, j, ] <- aFcst[, j, ] * fit$sd[j] + fit$mean[j]
+  return(list("draws"=aFcst, "mean"=apply(aFcst, c(1,2), mean)))
+}
+```
+
+```{r data_prep, include=FALSE}
+# ============================================================================
+# DATA PREPARATION: 2010 Q1 - 2020 Q4 (44 observations for training)
+# ============================================================================
+INT.ols  <- window(Int, c(2010,1), c(2020,4))
+UR.ols   <- window(UnEmp, c(2010,1), c(2020,4))
+INFL.ols <- window(Infl, c(2010,1), c(2020,4))
+
+yyall <- cbind(INT.ols, UR.ols, INFL.ols)
+colnames(yyall) <- c("INT", "UR", "INFL")
+Tall <- nrow(yyall)
+p_grid <- 1:4
+n <- 3
+M <- 1000
+
+lambda_grid <- lapply(c(0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10),
+                      function(l1) c(l1, 4, 1, 1, 1))
+
+T1_forecast <- 13
+```
+
+```{r timeseries_plot, fig.height=8, fig.width=10}
+fSaveFigure("timeseries.png", 10, 8, function(){
+  par(mfrow=c(3,1), mar=c(4, 4, 3, 1))
+  series <- list(window(Int, c(2010,1), c(2021,4)),
+                 window(UnEmp, c(2010,1), c(2021,4)),
+                 window(Infl, c(2010,1), c(2021,4)))
+  titles <- c("3-Month Interest Rate (%)", "Unemployment Rate (%)", "Inflation, SA annualized (%)")
+  for (j in 1:3){
+    plot(series[[j]], col="steelblue", lwd=2, main=titles[j], xlab="", ylab="")
+    rect(2021, par("usr")[3], 2022, par("usr")[4], col=rgb(0,0,0,0.08), border=NA)
+    grid(col="gray80", lty=3)
+  }
+})
+```
+
+```{r hyperparam_selection, include=FALSE}
+# ============================================================================
+# HYPERPARAMETER SELECTION (full 2010-2020 sample, reported for reference)
+# ============================================================================
+fit_full <- fFitBVAR(yyall, p_grid, lambda_grid)
+mdd_results <- fit_full$grid
+vLambda_best <- fit_full$lambda
+p <- fit_full$p
+```
+
+```{r forecasting, include=FALSE}
+# ============================================================================
+# RECURSIVE ONE-STEP-AHEAD FORECASTS (2013 Q2 - 2020 Q4)
+# At each origin t, standardization, lambda and posterior use data 1..t only.
+# ============================================================================
+T_start <- T1_forecast
+T_end   <- Tall - 1
+nFcst   <- T_end - T_start + 1
+
+fcst_Bayesian <- matrix(NA, nFcst, n)
+fcst_OLS      <- matrix(NA, nFcst, n)
+fcst_RW       <- matrix(NA, nFcst, n)
+actual        <- matrix(NA, nFcst, n)
+lambda_path   <- rep(NA, nFcst)
+p_path        <- rep(NA, nFcst)
+
+set.seed(123)
+for (t in T_start:T_end){
+  i <- t - T_start + 1
+  mY_t <- yyall[1:t, ]
+
+  fit_t <- fFitBVAR(mY_t, p_grid, lambda_grid)
+  fcst_Bayesian[i, ] <- fForecastBVAR(fit_t, 1, M)$mean[1, ]
+  lambda_path[i] <- fit_t$lambda[1]
+  p_path[i] <- fit_t$p
+
+  # Flat-prior (OLS) VAR with the same lag length as the BVAR
+  p_t <- fit_t$p
+  # (not estimable when there are fewer observations than regressors)
+  RegData_t <- fDataVARtoReg(mY_t, max(p_grid)+2, p_t)
+  if (nrow(RegData_t$mXX) > ncol(RegData_t$mXX)){
+    Phi_OLS_t <- solve(t(RegData_t$mXX) %*% RegData_t$mXX) %*%
+                 (t(RegData_t$mXX) %*% RegData_t$mYY)
+    fcst_OLS[i, ] <- c(1, t(mY_t[t:(t-p_t+1), , drop=FALSE])) %*% Phi_OLS_t
+  }
+
+  # Random walk: no-change forecast (Giannone, Lenza and Primiceri, 2015)
+  fcst_RW[i, ] <- mY_t[t, ]
+
+  actual[i, ] <- yyall[t + 1, ]
+}
+
+# Compare all models over the origins where the OLS VAR is estimable
+common <- !is.na(fcst_OLS[, 1])
+nCommon <- sum(common)
+mse_Bayesian <- colMeans((fcst_Bayesian - actual)[common, , drop=FALSE]^2)
+mse_OLS      <- colMeans((fcst_OLS - actual)[common, , drop=FALSE]^2)
+mse_RW       <- colMeans((fcst_RW - actual)[common, , drop=FALSE]^2)
+```
+
+```{r forecast_2021, include=FALSE}
+# ============================================================================
+# 2021 OUT-OF-SAMPLE FORECASTS: iterated 1- to 4-step-ahead from 2020 Q4
+# ============================================================================
+set.seed(3123)
+fcst_2021 <- fForecastBVAR(fit_full, 4, M, shocks=TRUE)
+fcst_2021_original <- fcst_2021$mean
+fcst_2021_q05 <- apply(fcst_2021$draws, c(1,2), quantile, probs=0.05)
+fcst_2021_q95 <- apply(fcst_2021$draws, c(1,2), quantile, probs=0.95)
+colnames(fcst_2021_original) <- c("INT", "UR", "INFL")
+
+actual_2021 <- cbind(
+  as.numeric(window(Int, c(2021,1), c(2021,4))),
+  as.numeric(window(UnEmp, c(2021,1), c(2021,4))),
+  as.numeric(window(Infl, c(2021,1), c(2021,4)))
+)
+colnames(actual_2021) <- c("INT", "UR", "INFL")
+
+rmse_2021 <- sqrt(colMeans((actual_2021 - fcst_2021_original)^2))
+bias_2021 <- colMeans(actual_2021 - fcst_2021_original)
+```
+
+# Forecast Evaluation
+
+```{r eval_table, results='asis'}
+var_labels <- c("Interest Rate", "Unemployment", "Inflation")
+cat("\\begin{table}[h!]\n\\centering\n")
+cat(sprintf("\\caption{One-Step-Ahead Forecast MSE, Recursive Pseudo-Out-of-Sample (%d of %d forecasts 2013Q2--2020Q4 at which the OLS VAR is estimable)}\n", nCommon, nFcst))
+cat("\\label{tab:forecast}\n\\begin{tabular}{lccccc}\n\\toprule\n")
+cat("\\textbf{Variable} & \\textbf{BVAR} & \\textbf{OLS VAR} & \\textbf{Random walk} & \\textbf{OLS / BVAR} & \\textbf{RW / BVAR} \\\\\n\\midrule\n")
+for (j in 1:n){
+  cat(sprintf("%s & %.3f & %.3f & %.3f & $%.1f\\times$ & $%.2f\\times$ \\\\\n",
+              var_labels[j], mse_Bayesian[j], mse_OLS[j], mse_RW[j],
+              mse_OLS[j] / mse_Bayesian[j], mse_RW[j] / mse_Bayesian[j]))
+}
+cat("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
+
+cat("\\begin{table}[h!]\n\\centering\n")
+cat("\\caption{2021 Hold-Out: Iterated 1--4 Quarter Forecasts from 2020Q4}\n")
+cat("\\begin{tabular}{lcc}\n\\toprule\n")
+cat("\\textbf{Variable} & \\textbf{RMSE} & \\textbf{Bias (actual $-$ forecast)} \\\\\n\\midrule\n")
+for (j in 1:n){
+  cat(sprintf("%s & %.3f & %.3f \\\\\n", var_labels[j], rmse_2021[j], bias_2021[j]))
+}
+cat("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
+```
+
+MSEs are in original units (percentage points squared). Lag length and $\lambda_1$ are chosen jointly by MDD. On the full sample the optimum is $p =$ `r p`, $\lambda_1 =$ `r vLambda_best[1]`; across recursive origins $p$ ranges from `r min(p_path)` to `r max(p_path)` and $\lambda_1$ from `r min(lambda_path)` to `r max(lambda_path)`.
+
+```{r forecast_plots, fig.height=8, fig.width=10}
+fSaveFigure("forecasts.png", 10, 8, function(){
+  par(mfrow=c(3,1), mar=c(4, 4, 3, 1))
+  var_names <- c("Interest Rate (%)", "Unemployment (%)", "Inflation, SA annualized (%)")
+  time_axis <- time(yyall)[(T_start+1):Tall]
+  for(j in 1:n){
+    ylim <- range(c(actual[, j], fcst_Bayesian[, j], fcst_OLS[, j]), na.rm=TRUE)
+    plot(time_axis, actual[, j], type="l", col="steelblue", lwd=2.5,
+         main=paste(var_names[j], "| RMSE Bayes =", round(sqrt(mse_Bayesian[j]), 3),
+                    "| RMSE OLS =", round(sqrt(mse_OLS[j]), 3), "| RMSE RW =", round(sqrt(mse_RW[j]), 3)),
+         xlab="", ylab="", ylim=ylim, cex.main=1.1)
+    lines(time_axis, fcst_Bayesian[, j], col="red", lty=2, lwd=1.8)
+    lines(time_axis, fcst_OLS[, j], col="gray50", lty=3, lwd=1.5)
+    legend("topright", c("Actual", "Bayesian VAR", "OLS VAR"),
+           col=c("steelblue", "red", "gray50"), lty=c(1,2,3), lwd=c(2.5,1.8,1.5), cex=0.9)
+    grid(col="gray80", lty=3, lwd=0.5)
+  }
+})
+```
+
+```{r forecast_2021_plot, fig.height=8, fig.width=10}
+fSaveFigure("forecasts_2021.png", 10, 8, function(){
+  par(mfrow=c(3,1), mar=c(4, 4, 3, 2))
+  var_names <- c("Interest Rate (%)", "Unemployment (%)", "Inflation, SA annualized (%)")
+  colors <- c("darkblue", "darkgreen", "darkred")
+  for(j in 1:3){
+    ylim <- range(c(actual_2021[, j], fcst_2021_q05[, j], fcst_2021_q95[, j]))
+    plot(1:4, actual_2021[, j], type="b", col=colors[j], lwd=2.5, pch=16,
+         main=paste(var_names[j], "| RMSE =", round(rmse_2021[j], 3),
+                    "| Bias =", round(bias_2021[j], 3)),
+         xlab="2021", ylab="", ylim=ylim, xaxt="n", cex.main=1.0)
+    polygon(c(1:4, 4:1), c(fcst_2021_q05[, j], rev(fcst_2021_q95[, j])),
+            col=rgb(1, 0, 0, 0.12), border=NA)
+    lines(1:4, fcst_2021_original[, j], col="red", lwd=2, lty=2)
+    axis(1, at=1:4, labels=c("Q1", "Q2", "Q3", "Q4"))
+    legend("topright", c("Actual", "Forecast (mean)", "90% predictive band"),
+           col=c(colors[j], "red", rgb(1, 0, 0, 0.3)),
+           lty=c(1, 2, NA), pch=c(NA, NA, 15), lwd=c(2.5, 2, NA), cex=0.9)
+    grid(col="gray80", lty=3)
+  }
+})
+```
+
+# Monetary Policy Impulse Responses
+
+A contractionary monetary policy shock is identified by sign restrictions on impact: the interest rate rises, unemployment rises, and inflation falls.
+
+```{r monetary_irf, include=FALSE}
+Hmax <- 16  # 4 years
+set.seed(123)
+postDraws <- fDrawMNIW(M, fit_full$post$mPhi, fit_full$post$mP,
+                       fit_full$post$mS, fit_full$post$nu)
+
+aIRF_sign_restricted <- array(NA, dim=c((Hmax+1), n, M))
+max_attempts <- 1000
+
+for(i in 1:M){
+  Phi_i <- postDraws$Phi[, , i]
+  Sigma_i <- postDraws$Sigma[, , i]
+  for (attempt in 1:max_attempts){
+    qtilde <- rnorm(n)
+    q <- qtilde / sqrt(sum(qtilde^2))
+    mIRF <- fVARIRF(Phi_i, Sigma_i, q, Hmax, n, p)
+    if (mIRF[1, 1] < 0) mIRF <- -mIRF  # normalize to a rate increase
+    if (mIRF[1, 2] > 0 && mIRF[1, 3] < 0){
+      aIRF_sign_restricted[, , i] <- mIRF
+      break
+    }
+  }
+}
+
+# Drop posterior draws with no rotation satisfying the restrictions
+accepted <- !is.na(aIRF_sign_restricted[1, 1, ])
+aIRF_sign_restricted <- aIRF_sign_restricted[, , accepted, drop=FALSE]
+
+# Convert from standard-deviation units to percentage points
+for (j in 1:n) aIRF_sign_restricted[, j, ] <- aIRF_sign_restricted[, j, ] * fit_full$sd[j]
+
+mIRF_Mean <- apply(aIRF_sign_restricted, c(1,2), mean)
+mIRF_q05  <- apply(aIRF_sign_restricted, c(1,2), quantile, probs=0.05)
+mIRF_q95  <- apply(aIRF_sign_restricted, c(1,2), quantile, probs=0.95)
+```
+
+Responses use `r sum(accepted)` of `r M` posterior draws (draws with no admissible rotation after `r max_attempts` tries are dropped).
+
+```{r monetary_plot, fig.height=5, fig.width=12}
+fSaveFigure("monetary_irf.png", 12, 5, function(){
+  par(mfrow=c(1, 3), mar=c(4, 4, 3, 2))
+  var_names <- c("Interest Rate", "Unemployment", "Inflation")
+  for(j in 1:n){
+    plot(0:Hmax, mIRF_Mean[, j], type="l", col="blue", lwd=2.5,
+         xlab="Horizon (quarters)", ylab=paste(var_names[j], "(pp)"),
+         main=var_names[j], ylim=range(c(mIRF_q05[, j], mIRF_q95[, j], 0)))
+    lines(0:Hmax, mIRF_q05[, j], col="red", lwd=1.5, lty=2)
+    lines(0:Hmax, mIRF_q95[, j], col="red", lwd=1.5, lty=2)
+    abline(h=0, col="black", lwd=0.8)
+    grid()
+  }
+})
+```
+
+# Fiscal Shock Analysis
+
+Following Blanchard and Perotti (2002), a recursively identified bivariate VAR(4) in quarterly log real government consumption and log real GDP with a constant and a linear time trend, spending ordered first so that it does not respond to other shocks within the quarter. The VAR is estimated by OLS/ML on the levels of the logs. Log responses are converted into CHF using the levels of spending and GDP in the last observation, and the multiplier is reported cumulatively.
+
+```{r fiscal_data, include=FALSE}
+fFiscalIRF <- function(start, end, Hmax, p = 4){
+  GOV  <- log(window(GovCons, start, end))
+  GDPR <- log(window(RGDP, start, end))
+  yyall <- cbind(GOV, GDPR)
+  Tall <- nrow(yyall)
+  n  <- 2
+  T1 <- p + 1
+
+  # Regressors: constant, time trend, then y(t-1), ..., y(t-p)
+  yy <- yyall[T1:Tall, ]
+  xx <- matrix(1, nrow=(Tall-T1+1), ncol=(n*p+2))
+  xx[, 2] <- 1:(Tall-T1+1)
+  for (i in 1:p){
+    xx[, (2+(i-1)*n+1):(2+i*n)] <- yyall[(T1-i):(Tall-i), ]
+  }
+  Phi_hat   <- solve(t(xx) %*% xx, t(xx) %*% yy)
+  Sigma_hat <- (t(yy) %*% yy - t(yy) %*% xx %*% Phi_hat) / (Tall-T1+1)
+  Sigma_hat_tr <- t(chol(Sigma_hat))
+
+  # IRF to a one-standard-deviation spending shock
+  IRFmat <- matrix(0, nrow=(Hmax+1), ncol=n)
+  IRFmat[1, ] <- Sigma_hat_tr[, 1]
+  xxIRF <- matrix(0, nrow=1, ncol=p*n)
+  xxIRF[1, 1:n] <- IRFmat[1, ]
+  Phi_hat_no_const <- Phi_hat[3:(n*p+2), , drop=FALSE]
+  for (h in 1:Hmax){
+    IRFmat[(1+h), ] <- xxIRF %*% Phi_hat_no_const
+    if (p > 1) xxIRF[1, (n+1):(n*p)] <- xxIRF[1, 1:(n*(p-1))]
+    xxIRF[1, 1:n] <- IRFmat[(1+h), ]
+  }
+
+  # Conversion into CHF at last-observation levels
+  irfGOV_CHF  <- exp(GOV[Tall])  * IRFmat[, 1]
+  irfGDPR_CHF <- exp(GDPR[Tall]) * IRFmat[, 2]
+
+  return(list("irfG"=IRFmat[, 1], "irfY"=IRFmat[, 2],
+              "multiplier"=irfGDPR_CHF / irfGOV_CHF,
+              "multiplier_cum"=cumsum(irfGDPR_CHF) / cumsum(irfGOV_CHF),
+              "GY_ratio"=exp(GOV[Tall] - GDPR[Tall]),
+              "nobs"=Tall))
+}
+
+Hmax_fiscal <- 16  # quarters (4 years)
+# Main estimate on the long pre-COVID sample;
+# the project's 2010-2020 window is shown for comparison
+fiscal_main  <- fFiscalIRF(c(1980,1), c(2019,4), Hmax_fiscal)
+fiscal_short <- fFiscalIRF(c(2010,1), c(2020,4), Hmax_fiscal)
+```
+
+```{r fiscal_plots, fig.height=5, fig.width=12}
+fSaveFigure("fiscal_irf.png", 12, 5, function(){
+  par(mfrow=c(1, 3), mar=c(4, 4, 3, 2))
+  h <- 0:Hmax_fiscal
+  plot(h, fiscal_main$irfG * 100, type="o", col="darkblue", lwd=2.5, pch=16,
+       xlab="Horizon (quarters)", ylab="Change (%)", main="Response of Gov Consumption",
+       ylim=range(c(fiscal_main$irfG * 100, fiscal_short$irfG * 100, 0)))
+  lines(h, fiscal_short$irfG * 100, type="o", col="gray50", lwd=1.5, pch=1, lty=2)
+  legend("bottomleft", c("1980Q1-2019Q4 (main)", "2010Q1-2020Q4"), col=c("darkblue", "gray50"),
+         lty=c(1, 2), pch=c(16, 1), cex=0.8)
+  abline(h=0, col="red", lwd=1, lty=2)
+  grid(col="gray80", lty=3)
+
+  plot(h, fiscal_main$irfY * 100, type="o", col="darkgreen", lwd=2.5, pch=16,
+       xlab="Horizon (quarters)", ylab="Change (%)", main="Response of Real GDP",
+       ylim=range(c(fiscal_main$irfY * 100, fiscal_short$irfY * 100, 0)))
+  lines(h, fiscal_short$irfY * 100, type="o", col="gray50", lwd=1.5, pch=1, lty=2)
+  abline(h=0, col="red", lwd=1, lty=2)
+  grid(col="gray80", lty=3)
+
+  plot(h, fiscal_main$multiplier_cum, type="o", col="purple", lwd=2.5, pch=16,
+       xlab="Horizon (quarters)", ylab="CHF GDP per CHF spending",
+       main="Cumulative Fiscal Multiplier (1980-2019)",
+       ylim=range(c(fiscal_main$multiplier_cum, 0, 1)))
+  abline(h=c(0, 1), col=c("red", "gray60"), lwd=1, lty=c(2, 3))
+  grid(col="gray80", lty=3)
+})
+```
+
+The main estimate uses `r fiscal_main$nobs` quarters from 1980 to 2019; the gray lines re-estimate the same specification on the project's `r fiscal_short$nobs`-quarter 2010--2020 window. In that short sample the cumulative spending response returns to zero within four years, so the CHF multiplier ratio is not meaningful there and is not plotted. Government consumption is about `r round(100 * fiscal_main$GY_ratio)`% of GDP, which is why a modest percentage response of GDP translates into a sizable CHF multiplier.
+
+## Data Sources
+
+- **Interest Rate (INT):** Swiss 3-month LIBOR, from FRED / ECB.
+- **Unemployment (UR):** Swiss State Secretariat for Economic Affairs (SECO), seasonally adjusted. https://www.seco.admin.ch/
+- **Inflation (INFL):** Swiss CPI, Swiss National Bank (SNB). The raw quarter-on-quarter changes are converted into a price index, seasonally adjusted with X-13ARIMA-SEATS (1990--2021), and expressed as annualized quarter-on-quarter log changes ($400 \times \Delta \log$ CPI).
+- **Real GDP:** Swiss Federal Statistical Office (FSO). https://www.bfs.admin.ch/
+- **Government consumption:** real general government final consumption expenditure, seasonally adjusted (OECD Main Economic Indicators via FRED, series NAEXKP03CHQ652S).
+
+All data are publicly available from the sources listed above and are included in `Data/`.
